@@ -1,0 +1,14 @@
+{"type": "config", "lo": -2, "hi": 5, "mode": "full_outer", "left_partitions": ["lp0", "lp1"], "right_partitions": ["rp0"]}
+{"type": "watermark", "side": "L", "partition": "lp0", "w": 0}
+{"type": "watermark", "side": "L", "partition": "lp1", "w": 0}
+{"type": "data", "side": "R", "partition": "rp0", "seq": 1, "key": "dev-2", "time": 20}
+{"type": "barrier", "name": "R-waiting"}
+{"type": "watermark", "side": "L", "partition": "lp0", "w": 22}
+{"type": "watermark", "side": "L", "partition": "lp1", "w": 22}
+{"type": "barrier", "name": "at-22"}
+{"type": "watermark", "side": "L", "partition": "lp0", "w": 23}
+{"type": "watermark", "side": "L", "partition": "lp1", "w": 23}
+{"type": "barrier", "name": "sealed"}
+{"type": "end", "side": "L", "partition": "lp0"}
+{"type": "end", "side": "L", "partition": "lp1"}
+{"type": "end", "side": "R", "partition": "rp0"}

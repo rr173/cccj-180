@@ -1,0 +1,11 @@
+{"type": "config", "lo": -2, "hi": 5, "mode": "left_outer", "left_partitions": ["lp0"], "right_partitions": ["rp0", "rp1"]}
+{"type": "watermark", "side": "R", "partition": "rp0", "w": 1000}
+{"type": "data", "side": "L", "partition": "lp0", "seq": 1, "key": "dev-9", "time": 10}
+{"type": "barrier", "name": "silent-rp1"}
+{"type": "watermark", "side": "R", "partition": "rp0", "w": 2000}
+{"type": "barrier", "name": "big-wm-not-enough"}
+{"type": "watermark", "side": "R", "partition": "rp1", "w": 100}
+{"type": "barrier", "name": "now-sealed"}
+{"type": "end", "side": "L", "partition": "lp0"}
+{"type": "end", "side": "R", "partition": "rp0"}
+{"type": "end", "side": "R", "partition": "rp1"}

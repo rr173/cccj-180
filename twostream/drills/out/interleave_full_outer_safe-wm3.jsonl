@@ -1,0 +1,29 @@
+{"type": "config", "lo": -2, "hi": 5, "mode": "full_outer", "left_partitions": ["la", "lb"], "right_partitions": ["ra", "rb"]}
+{"type": "data", "side": "L", "partition": "lb", "seq": 1, "key": "c", "time": 12}
+{"type": "watermark", "side": "L", "partition": "lb", "w": 5}
+{"type": "data", "side": "L", "partition": "lb", "seq": 2, "key": "a", "time": 5}
+{"type": "watermark", "side": "L", "partition": "lb", "w": 100}
+{"type": "data", "side": "R", "partition": "ra", "seq": 1, "key": "a", "time": 6}
+{"type": "watermark", "side": "R", "partition": "ra", "w": 4}
+{"type": "data", "side": "R", "partition": "rb", "seq": 1, "key": "c", "time": 10}
+{"type": "watermark", "side": "R", "partition": "rb", "w": -4}
+{"type": "data", "side": "L", "partition": "la", "seq": 1, "key": "a", "time": 5}
+{"type": "watermark", "side": "L", "partition": "la", "w": -3}
+{"type": "data", "side": "L", "partition": "la", "seq": 2, "key": "b", "time": 7}
+{"type": "data", "side": "R", "partition": "rb", "seq": 2, "key": "a", "time": 5}
+{"type": "data", "side": "R", "partition": "ra", "seq": 2, "key": "a", "time": 4}
+{"type": "watermark", "side": "R", "partition": "ra", "w": 5}
+{"type": "data", "side": "L", "partition": "lb", "seq": 3, "key": "b", "time": 36893488147419103235}
+{"type": "data", "side": "L", "partition": "lb", "seq": 4, "key": "a", "time": 100}
+{"type": "data", "side": "R", "partition": "rb", "seq": 3, "key": "b", "time": -4}
+{"type": "watermark", "side": "R", "partition": "rb", "w": 50}
+{"type": "data", "side": "R", "partition": "ra", "seq": 3, "key": null, "time": 5}
+{"type": "watermark", "side": "R", "partition": "ra", "w": 36893488147419103237}
+{"type": "data", "side": "R", "partition": "rb", "seq": 4, "key": "x", "time": 50}
+{"type": "data", "side": "R", "partition": "ra", "seq": 4, "key": "b", "time": 36893488147419103237}
+{"type": "data", "side": "L", "partition": "la", "seq": 3, "key": null, "time": 9}
+{"type": "data", "side": "L", "partition": "la", "seq": 4, "key": "a", "time": -3}
+{"type": "end", "side": "L", "partition": "la"}
+{"type": "end", "side": "L", "partition": "lb"}
+{"type": "end", "side": "R", "partition": "ra"}
+{"type": "end", "side": "R", "partition": "rb"}

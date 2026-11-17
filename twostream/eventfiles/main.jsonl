@@ -1,0 +1,13 @@
+# Main example: lo=-2, hi=5, full_outer.
+# Left L@10 must not be null-padded while right_min = min(15,30) = 15;
+# R@15 matches it (inclusive endpoint); rp0 -> 16 seals it.
+{"type":"config","lo":-2,"hi":5,"mode":"full_outer","left_partitions":["lp0"],"right_partitions":["rp0","rp1"]}
+{"type":"watermark","side":"R","partition":"rp0","w":15}
+{"type":"watermark","side":"R","partition":"rp1","w":30}
+{"type":"data","side":"L","partition":"lp0","seq":1,"key":"dev-1","time":10,"payload":{"kind":"request"}}
+{"type":"barrier","name":"L-arrived"}
+{"type":"data","side":"R","partition":"rp0","seq":1,"key":"dev-1","time":15,"payload":{"kind":"response"}}
+{"type":"watermark","side":"R","partition":"rp0","w":16}
+{"type":"end","side":"L","partition":"lp0"}
+{"type":"end","side":"R","partition":"rp0"}
+{"type":"end","side":"R","partition":"rp1"}
