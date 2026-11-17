@@ -1,0 +1,8 @@
+# generated artifacts (drills, local runs)
+drills/out/
+*.db
+*.db-wal
+*.db-shm
+*.lock
+__pycache__/
+*.pyc

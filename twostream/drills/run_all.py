@@ -13,6 +13,8 @@ DRILLS = [
     "drills.drill_barrier",
     "drills.drill_interleave",
     "drills.drill_hotkey",
+    "drills.drill_recover",
+    "drills.drill_deliver",
 ]
 
 

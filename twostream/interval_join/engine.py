@@ -31,7 +31,13 @@ owes them a final null-padded verdict.
 State lives in SQLite (time index over an order-preserving encoding of
 arbitrary-precision integers).  Emitted results go to a SQLite outbox
 and stream out through pull_results(); nothing assembles all matches or
-a hot key's candidates in memory.  First version: no crash recovery.
+a hot key's candidates in memory.
+
+Durability: by default the seq/watermark/end ledgers are in-memory only
+(single-run engine, no crash recovery).  With _durable=True they are
+written through to ledger tables inside the ambient transaction and
+reloaded from disk on open; the persistent job store
+(interval_join.jobstore) builds recoverable jobs on that mode.
 """
 
 from __future__ import annotations
@@ -99,6 +105,46 @@ CREATE TABLE IF NOT EXISTS latebox(
 );
 """
 
+# Durable per-partition ledgers (created only when the engine runs with
+# _durable=True).  Values are decimal text so arbitrary-precision seqs and
+# watermarks survive persistence exactly (never floats).
+_LEDGER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS seq_ledger(
+  side TEXT NOT NULL, partition TEXT NOT NULL, last_seq_txt TEXT NOT NULL,
+  PRIMARY KEY(side, partition)
+);
+CREATE TABLE IF NOT EXISTS wm_ledger(
+  side TEXT NOT NULL, partition TEXT NOT NULL, wm_txt TEXT NOT NULL,
+  PRIMARY KEY(side, partition)
+);
+CREATE TABLE IF NOT EXISTS end_ledger(
+  side TEXT NOT NULL, partition TEXT NOT NULL,
+  PRIMARY KEY(side, partition)
+);
+"""
+
+
+def _validate_config(lo, hi, mode, left_partitions, right_partitions):
+    """Validate a join configuration.  Returns (lp, rp) as lists.
+    Raises ValueError on any violation."""
+    if isinstance(lo, bool) or isinstance(hi, bool) \
+            or not isinstance(lo, int) or not isinstance(hi, int):
+        raise ValueError("lo and hi must be integers")
+    if lo > hi:
+        raise ValueError(f"lo ({lo}) must be <= hi ({hi})")
+    if mode not in _MODES:
+        raise ValueError(f"mode must be one of {_MODES}, got {mode!r}")
+    lp = list(left_partitions)
+    rp = list(right_partitions)
+    if not lp or not rp:
+        raise ValueError("each side must declare at least one partition")
+    for p in lp + rp:
+        if not isinstance(p, str) or not p:
+            raise ValueError(f"partition names must be non-empty strings, got {p!r}")
+    if len(set(lp)) != len(lp) or len(set(rp)) != len(rp):
+        raise ValueError("duplicate partition names within a side")
+    return lp, rp
+
 
 def _dump_payload(p: Any) -> Optional[str]:
     if p is None:
@@ -115,44 +161,83 @@ class JoinEngine:
     """Streaming two-stream interval join.  See module docstring."""
 
     def __init__(self, db_path: str, lo: int, hi: int, mode: str,
-                 left_partitions, right_partitions):
-        if isinstance(lo, bool) or isinstance(hi, bool) \
-                or not isinstance(lo, int) or not isinstance(hi, int):
-            raise ValueError("lo and hi must be integers")
-        if lo > hi:
-            raise ValueError(f"lo ({lo}) must be <= hi ({hi})")
-        if mode not in _MODES:
-            raise ValueError(f"mode must be one of {_MODES}, got {mode!r}")
-        lp = list(left_partitions)
-        rp = list(right_partitions)
-        if not lp or not rp:
-            raise ValueError("each side must declare at least one partition")
-        for p in lp + rp:
-            if not isinstance(p, str) or not p:
-                raise ValueError(f"partition names must be non-empty strings, got {p!r}")
-        if len(set(lp)) != len(lp) or len(set(rp)) != len(rp):
-            raise ValueError("duplicate partition names within a side")
+                 left_partitions, right_partitions, *,
+                 _conn: Optional[sqlite3.Connection] = None,
+                 _durable: bool = False):
+        lp, rp = _validate_config(lo, hi, mode, left_partitions,
+                                  right_partitions)
         self.lo, self.hi, self.mode = lo, hi, mode
         self.left_partitions = lp
         self.right_partitions = rp
+        self._owns_conn = _conn is None
+        self._durable = _durable
         try:
-            self._conn = sqlite3.connect(db_path)
+            self._conn = _conn if _conn is not None else sqlite3.connect(db_path)
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
+            if _durable:
+                self._conn.executescript(_LEDGER_SCHEMA)
             self._conn.commit()
         except sqlite3.Error as e:
             raise ResourceError(f"cannot open state database {db_path!r}: {e}") from e
-        # In-memory bookkeeping (event state itself is on disk).  v1 does
-        # not promise crash recovery, so seq/watermark ledgers live here.
+        # In-memory bookkeeping (event state itself is on disk).  In the
+        # default single-run mode the seq/watermark/end ledgers live only
+        # here; in durable mode they are written through to the ledger
+        # tables inside the ambient transaction and reloaded from disk by
+        # reload_ledgers() (open time / lock acquisition / rollback).
         self._wm: Dict[tuple, Optional[int]] = {}     # (side,part) -> None(-inf) | int
         self._ended: Dict[tuple, bool] = {}
         self._last_seq: Dict[tuple, int] = {}
         self._failed = False
+        self.reload_ledgers()
 
     # ---------------------------------------------------------- lifecycle
     def close(self) -> None:
-        self._conn.close()
+        if self._owns_conn:
+            self._conn.close()
+
+    # ---------------------------------------------------- durable ledgers
+    def reload_ledgers(self) -> None:
+        """(Re)load the seq/watermark/end ledgers from the database,
+        discarding the in-memory copies.  No-op unless durable."""
+        self._wm = {}
+        self._ended = {}
+        self._last_seq = {}
+        if not self._durable:
+            return
+        for side, part, txt in self._conn.execute(
+                "SELECT side, partition, last_seq_txt FROM seq_ledger"):
+            self._last_seq[(side, part)] = int(txt)
+        for side, part, txt in self._conn.execute(
+                "SELECT side, partition, wm_txt FROM wm_ledger"):
+            self._wm[(side, part)] = int(txt)
+        for side, part in self._conn.execute(
+                "SELECT side, partition FROM end_ledger"):
+            self._ended[(side, part)] = True
+
+    def snapshot_ledgers(self):
+        """In-memory snapshot of the seq/watermark/end ledgers, for
+        embedders that roll a failed multi-message transaction back."""
+        return (dict(self._wm), dict(self._ended), dict(self._last_seq))
+
+    def restore_ledgers(self, snap) -> None:
+        """Undo a snapshot_ledgers() snapshot (after a transaction
+        rollback discarded the corresponding durable writes)."""
+        wm, ended, last_seq = snap
+        self._wm = dict(wm)
+        self._ended = dict(ended)
+        self._last_seq = dict(last_seq)
+
+    def apply_message(self, msg) -> None:
+        """Dispatch one message inside the *caller's* transaction.
+
+        Unlike feed()/feed_batch() this neither commits nor latches the
+        engine into the failed state on InputError; embedders managing
+        their own transactions (the persistent job store) combine it with
+        snapshot_ledgers()/restore_ledgers() to roll a failed batch back.
+        """
+        self._dispatch(msg)
 
     def __enter__(self) -> "JoinEngine":
         return self
@@ -227,6 +312,10 @@ class JoinEngine:
                 f"{m.side}/{m.partition}: seq {m.seq} not strictly increasing "
                 f"(already saw {last})")
         self._last_seq[pk] = m.seq
+        if self._durable:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO seq_ledger(side,partition,last_seq_txt)"
+                " VALUES (?,?,?)", (m.side, m.partition, str(m.seq)))
         wm = self._wm.get(pk)
         if wm is not None and m.time < wm:
             # late bypass: recorded, never joined, never retracts anything
@@ -246,11 +335,19 @@ class JoinEngine:
             raise InputError(
                 f"{m.side}/{m.partition}: watermark regression {m.w} < {cur}")
         self._wm[pk] = m.w
+        if self._durable:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO wm_ledger(side,partition,wm_txt)"
+                " VALUES (?,?,?)", (m.side, m.partition, str(m.w)))
         self._expire_opposite(m.side)
 
     def _on_end(self, m: End) -> None:
         self._check_partition(m.side, m.partition)
         self._ended[(m.side, m.partition)] = True  # effective watermark = +inf
+        if self._durable:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO end_ledger(side,partition) VALUES (?,?)",
+                (m.side, m.partition))
         self._expire_opposite(m.side)
 
     # -------------------------------------------------------------- join
