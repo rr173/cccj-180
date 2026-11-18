@@ -134,6 +134,158 @@ python -m interval_join.jobcli deliver --db job.db --warehouse wh.db --page-size
 修改锁）；`4` 存储格式错误（缺失/空库/旧格式/不兼容/损坏）。测试钩子导致的
 模拟崩溃退出码为 `117`（`TWOSTREAM_CRASH_AT`，正常路径不依赖它）。
 
+## 设备历史归属统计仓（attribution mart）
+
+运维按“请求发生时设备属于哪个团队”核算连接质量。归属台账通常隔天才补齐，
+甚至会改写上周的一段归属。`attribution_mart` 在**独立的 SQLite 文件**中维护
+这份统计，输入只读地取自现有 `SQLiteWarehouse` 的 `wh_meta` / `wh_results`：
+
+- **不重跑双流连接**：原 `JobStore`、批次推进、确认投递、`wh_*` 表完全不变。
+- 只读接入：源仓库以 `mode=ro` 打开，mart 无法改写仓库行、回执或源作业的确认
+  位置。
+- 统计粒度 **（窗口起点, 归属）**。每条 match 用左事件时间归窗，lpad 用左时间、
+  rpad 用右时间：`window = O + floor((t-O)/W)*W`（左闭右开，负时间向下取整）。
+  用同一个锚点时间查设备当时的归属。设备键为 null 或没有覆盖段时进入专门的
+  **未知归属组**；它在存储中用空 owner 键表示，而真实 owner 不允许为空文本，
+  因此与真实团队名（包括字面值 `"unknown"`）永不混同。
+- 每组输出 match 对数、匹配请求数、未匹配请求数（lpad）、未匹配响应数（rpad），
+  以及 match 延迟 `rtime-ltime` 的 sum/min/max/p50/p95。匹配请求按
+  `(job_id, 左分区, 左 seq)` 去重：一请求匹配多个响应只算一个请求，不同作业
+  中同名分区/seq 互不合并。分位数为 nearest-rank `ceil(p*n)`（p50=`(n+1)//2`，
+  p95=`(19n+19)//20`），不插值；空 match 组 sum 为 0，min/max/分位数为 null；
+  组内计数全为 0 时不保留该组。
+- time、归属边界、O、W、延迟与求和全程任意精度整数：SQLite 中存十进制文本并用
+  `enc_int` 保序键，绝不经过浮点或 64 位 SQLite 整数运算。
+
+### 创建、同步与版本
+
+```python
+from attribution_mart import AttributionMart
+
+mart = AttributionMart.create(
+    "mart.db", warehouse="warehouse.db", job_ids=["job-1", "job-2"],
+    width=10, origin=0)          # 绑定仓库自身 warehouse_id、作业集合、W、O
+with mart.modify():
+    mart.replace_attribution(0, {                # 初始台账（可选）
+        "dev-a": [{"start": 0, "end": 20, "owner": "A"},
+                  {"start": 20, "end": None, "owner": "B"}],
+    })
+    summary = mart.sync()
+```
+
+- 创建时绑定仓库的**持久身份** `warehouse_id`、要处理的 `job_id` 集合，以及固定
+  正整数 W 与整数原点 O。仓库换路径仍可用（`AttributionMart.open(path,
+  warehouse=new_path)` 或 `mart.rebind_warehouse()`，按身份而非路径匹配）；误指
+  另一个仓库抛 `MartIdentityError` 且不写入。
+- **一次 sync 只处理同一个已提交读快照**：先在一个只读事务里捕获各配置作业的
+  结果上界，并在同一事务内读取恰好 `(已处理, 上界]`；期间采集端新提交的数据对
+  本次不可见，留给下一次。返回各作业的捕获上界、已处理位置和新增事实/请求数。
+  没有新结果并不表示源作业已结束或已全部交付——mart 只描述仓库现有内容。
+- 事实身份是 `(job_id, offset)`；重复同步不会累计第二次。新范围出现 offset 缺口
+  或无法解释的行（未知 kind、缺失身份字段）时**明确失败**，上一版本原样保留，
+  不会跳过缺口。
+- 多个作业的位置向量、事实、请求、延迟频次、当前归属与统计摘要作为**同一个
+  mart 版本**在一个事务里发布（WAL）。读者要么看到上一个完整版本，要么看到新
+  完整版本，不会看到一半作业或一半统计。
+
+### 归属更正
+
+```python
+rev = mart.status()["mart_revision"]
+with mart.modify():
+    mart.replace_attribution(rev, {
+        # 只改 [8,20) 的归属；未覆盖的设备/时段保持原样
+        "dev-a": [{"start": 0, "end": 8, "owner": "A"},
+                  {"start": 8, "end": 20, "owner": "C"},
+                  {"start": 20, "end": None, "owner": "B"}],
+        "dev-b": [],                    # 空历史 = 清除该设备全部归属
+    })
+```
+
+- 传入 `expected_revision`（当前 mart 版本）与若干设备的**完整替换历史**。整体
+  校验、整体发布：过期 revision（`StaleRevisionError`）、重复设备键、任一非法
+  区间（空段、倒置、重叠、空 owner）都使整次更正被拒绝，其他设备与统计不会部分
+  生效。允许空档、允许首尾相接、禁止重叠；输入段次序可任意。
+- 一次成功更正只增加**一个维表 revision**，即使替换后的有效归属完全没有变化。
+- **不重读源仓库、不重跑 JoinEngine**：先比较新旧时间映射，得到归属实际改变的
+  整数区间，再经 `(device, anchor)` 索引按键集分页只访问这些区间内的已存事实。
+  只重算受影响汇总组（旧组与新组），其他组不重写。未覆盖到的设备与时段保持原归属。
+  更正同样作用于后续新事实：之后同步的新事实按新台账归组。
+- 定位证据见 `python -m drills.drill_attribution_scale`（25 万事实中改一个窄区间，
+  实际访问事实数、`EXPLAIN QUERY PLAN`、重算组数、峰值 RSS、前后业务数字）。
+
+### 查询与展开
+
+```python
+q = mart.query()                       # 当前已提交快照
+q["view_token"], q["mart_revision"], q["dim_revision"], q["positions"]
+for g in q["groups"]: ...              # (window_start, owner) 及各指标
+mart.query(view_token=q["view_token"], after=(0, "A"), limit=50)  # 分页
+
+page = mart.expand(q["view_token"], 0, "A", kind="match", limit=100)
+page = mart.expand(q["view_token"], 0, "A", limit=100,
+                   after=page["next_after"])              # 下一页
+```
+
+- `query` 与 `expand` 在同一只读快照中读取，返回该快照的 mart 版本、维表 revision
+  与各作业处理位置。`expand` 必须传入所查版本；版本已过期抛 `StaleVersionError`，
+  绝不用新版明细解释旧版数字（不要求无限保留历史快照）。
+- 展开按 `(window, owner)` 分页，返回仓库原 `(job_id, offset)`、连接双方身份与
+  时间、锚点与窗口起点、延迟，以及命中的归属区间（或未知原因：`null device key`
+  / `no covering attribution segment`），并回读仓库原行供独立核对。展开的身份集合
+  与组内计数一致，因此可以从明细独立算回统计。
+
+### 并发与恢复
+
+- 每个 mart 同时只允许一个修改者：`with mart.modify():` 使用附带文件上的 flock；
+  第二个修改者得到 `MartBusyError`（CLI 退出码 3）。sync 与归属更正互斥。
+  读者不需要锁，长操作期间仍读上一个完整版本。
+- 提交前被强制结束（SIGKILL / `os._exit`）: 事务回滚，回到旧版；提交后被杀：
+  新版完整保留。锁由内核在进程退出时释放，重开后直接继续，无需手工清理。
+- 若遇到未知格式版本、缺表、损坏或无法解释的元数据，`MartFormatError`（退出码 4）
+  明确拒绝，不会静默解释。
+
+### 命令行
+
+```bash
+python -m attribution_mart.cli create --mart mart.db --warehouse warehouse.db \
+    --jobs JOB1 JOB2 --width 10 --origin 0
+python -m attribution_mart.cli sync --mart mart.db
+python -m attribution_mart.cli correct --mart mart.db --expected-revision 3 \
+    --history history.json            # 或 --history -
+python -m attribution_mart.cli query --mart mart.db [--view TOKEN] \
+    [--after WINDOW:OWNER] [--limit N]
+python -m attribution_mart.cli expand --mart mart.db --view TOKEN \
+    --window 0 --owner A [--kind match] [--limit 100] [--after FACT_ID]
+python -m attribution_mart.cli status --mart mart.db
+python -m attribution_mart.cli rebind --mart mart.db --warehouse moved.db
+```
+
+`history.json` 形如 `{"dev-a": [{"start": 0, "end": 20, "owner": "A"}]}`，
+也接受 `{"devices": {...}}`。未知归属组用 `--unknown`（JSON 中为 `null`）。
+退出码：`0` 成功；`1` 拒绝（非法历史、过期 revision、仓库不符、新范围缺口、
+未知 kind、过期 view）；`2` 用法错误；`3` 忙；`4` mart 格式错误。
+
+### 内部表示与更新策略
+
+- `facts`：每个仓库结果一行，含 `(job_id, offset)`、双方身份与时间、锚点、
+  `enc_int` 顺序键的窗口、`owner_k` 与未知原因；`(ws_enc, owner_k)` 与
+  `(k, anchor_enc)` 两个索引分别支撑分组统计与按设备区间定位。
+- `reqs`：每个匹配请求一行，主键 `(job_id, lp, ls)` 保证去重请求；不同作业互不
+  合并。match 延迟另存 `lat_freq`（`(ws_enc, owner_k, lat_enc) -> cnt`），因此
+  “一个请求只算一次”与“每个 match 都进入分位数”同时成立。同一请求的所有 match
+  共享左事件时间，因此锚点、窗口与归属必然相同——更正时它们整体一起迁移，不会
+  出现跨组的“半个请求”。
+- 统计摘要 `group_stats` 在每次发布事务内由这些表重算受影响组：min/max/sum 与
+  精确 nearest-rank 分位数由一次按 `lat_enc` 升序的流式扫描 + 累计计数得到，
+  不在 Python 内存中保存延迟列表。历史更正只把旧组/新组标脏重算。
+- 归属台账 `attr_segments`（按设备排序的段）+ `changed_intervals` 二分比较新旧
+  归属，只在归属真正改变的区间内定位事实，从而支持“扣旧组、补新组”的精确扣减。
+  sync 与更正都通过有界 LRU（`HistoryIndex`）按需查询单个设备的历史，不把整个
+  归属维表载入内存。
+- 展开时报告的归属区间取自**当前版本**的台账（对当页设备按需查询），因此段被
+  拆分/合并但 owner 未变时，无需重写任何事实行即可保持展开结果与数字一致。
+
 ## 事件文件演练
 
 JSON Lines，首条可为 `config`；`barrier` 记录触发演练检查点，不进入引擎。
@@ -150,6 +302,9 @@ python -m drills.drill_interleave   # 小样本离线枚举 vs 多种合法交�
 python -m drills.drill_hotkey       # 磁盘热点键大输入：计数/采样/RSS/回收
 python -m drills.drill_recover      # 可恢复作业：真实子进程崩溃后的业务验收
 python -m drills.drill_deliver      # 热点输入确认投递：中途杀进程再恢复
+python -m drills.drill_attribution_hand    # 设备归属：手算“为什么要扣回”
+python -m drills.drill_attribution_accept  # 归属统计：独立参考 + 交错 + 崩溃 + 并发
+python -m drills.drill_attribution_scale   # 归属统计：25 万事实下窄区间更正的访问证据
 python -m drills.run_all            # 全部演练 + 单元测试
 python -m unittest discover -s tests -v
 ```
@@ -162,4 +317,9 @@ CLI 退出码：0 完成；1 输入/资源错误（失败）；2 用法错误；
   时使用 `JobStore` 持久作业，其全部状态落盘，且不靠重放事件文件重建。
 - 单进程单线程；输出顺序随调度变化，但身份对多重集合、补 null 集合、late
   集合确定。持久作业的交付身份 `(job_id, 通道, offset)` 在重送与重开后稳定。
-- 演练生成物（`drills/out/` 下的事件文件与 SQLite 库）不进入版本控制。
+- mart 只统计已投递到仓库的结果：不读取 `wh_late`，不推断源作业是否结束或
+  是否全部交付。
+- 更正只重算被影响的汇总组；未被影响组的摘要行不重写，受影响的组从事实表精确
+  重算，因此最小值/分位数位置被移走时不会沿用旧统计。
+- 演练生成物（`drills/out/` 下的事件文件与 SQLite 库）不进入版本控制；大数据
+  （20 万以上无关事实、热点设备）在运行时产生。

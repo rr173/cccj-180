@@ -1,0 +1,9 @@
+{
+  "dev-a": [
+    {"start": 0, "end": 20, "owner": "team-red"},
+    {"start": 20, "end": 40, "owner": "team-blue"},
+    {"start": 40, "end": null, "owner": "team-red"}
+  ],
+  "dev-b": [],
+  "dev-c": [{"start": null, "end": 0, "owner": "unknown"}]
+}

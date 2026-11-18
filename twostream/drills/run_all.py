@@ -15,6 +15,9 @@ DRILLS = [
     "drills.drill_hotkey",
     "drills.drill_recover",
     "drills.drill_deliver",
+    "drills.drill_attribution_hand",
+    "drills.drill_attribution_accept",
+    "drills.drill_attribution_scale",
 ]
 
 
