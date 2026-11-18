@@ -286,6 +286,121 @@ python -m attribution_mart.cli rebind --mart mart.db --warehouse moved.db
 - 展开时报告的归属区间取自**当前版本**的台账（对当页设备按需查询），因此段被
   拆分/合并但 owner 未变时，无需重写任何事实行即可保持展开结果与数字一致。
 
+## 共享响应调查（response_investigation）
+
+排查入仓后的设备连接时，两条请求可能没有直接匹配到同一个响应，却被一串共享响应
+间接连在一起。`response_investigation` 在**独立的 SQLite 文件**里保存一次只读
+调查，回答三件事：哪些请求必须一起调查、P→Q 的组是怎么合并/增长/新出现的，以及
+两条指定请求**最早在哪条入仓结果之后**连通、当时的原始匹配链是什么。
+
+```python
+from response_investigation import ResponseInvestigation
+
+inv = ResponseInvestigation.build(
+    "inv.db", warehouse="warehouse.db", jobs=["job-1", "job-2"],
+    P={"job-1": 4, "job-2": 0}, Q={"job-1": 9, "job-2": 40})
+inv.request_node("P", ("job-1", "lp", 3)) # 该请求在 P 的节点与组（或 None）
+inv.groups("Q", after=None, limit=50)     # 有序组列表，键集分页
+inv.group_change(gid)                     # merge / same / new + 计数
+inv.change_sources(gid, limit=100)        # 旧组 id 分页
+inv.group_members("Q", gid, limit=100)    # 成员分页
+inv.group_edges("Q", gid, limit=100)      # 原始 match 行按 (job, 数值 offset)
+inv.resolve("Q", ("job-1", "lp", 1), ("job-1", "lp", 4))
+inv.chain_page("Q", a, b, after=0, limit=64)
+inv.stats()                               # 实际读取行数（定位/分页/链）
+```
+
+### 输入与快照
+
+- 输入是明确列出的作业及各自的两组 `results` 位置 P、Q（包含上界，
+  `0 <= P[job] <= Q[job]`，0 表示该次观察不含此作业结果）。**不按事件时间或
+  跨作业 offset 推测全局先后**：图状态就是 `{job: bound}`。
+- 源仓库以 `mode=ro` 打开，并在**一个延迟读事务**里先核对身份与上界、再读取
+  `1..Q[job]`：同一快照内的核对与读取必然一致，构建期间新入仓的内容对本次不可见，
+  超过 Q 的内容不参与调查。不改源库、job 库、投递位置或归属统计仓，也不从事件
+  文件重新匹配。
+- 每个作业 `1..Q[job]` 必须位置连续；超界、缺口、未知结果种类、无法解释的 match
+  行都会让构建失败，消息给出作业与位置。成功调查的仓库身份、P/Q、证据行和查询
+  索引写进独立调查库，源库移走后仍能打开。
+- 构建先在 `*.tmp-<uuid>` 中完成，全部事务提交后**最后**写入身份行
+  （`inv_meta`），再原子替换目标路径。失败或中途被杀不会留下可被误认为成功的
+  调查库（临时文件也打不开，因为没有身份行）；旧文件在 `overwrite=True` 时才被
+  替换。刻意不跑 `ANALYZE`：实测它的 `sqlite_stat1` 会让 SQLite 为下面的 BFS
+  选择慢得多的执行形状（4000 节点链上约慢 400 倍）。
+
+### 图语义
+
+- 每条 `match` 是一请求一响应之间的无向边；`lpad`、`rpad` 和 `late` 不产生边或
+  节点，只在这些记录中出现过的请求不算“已见”。节点是
+  `(job_id, side, partition, seq)`：不同作业、不同侧的同名分区/seq/设备键互不
+  混淆。
+- 组是沿匹配边互相可达的**完整**节点集合（不是某个响应的直接邻居，也不按设备键
+  相连）。组标识是组内最小节点；节点顺序为 `(job 文本, 左先于右, 分区文本,
+  数值 seq)`，文本按 Unicode 码点、seq 按任意精度整数比较。
+- 每个前缀状态都保留最小新增节点，P/Q 两个状态完整物化（组、成员、证据边）。
+  构建按 `(job, offset)` 升序做并查集（按 rank 合并），组展开用 SQL 递归/路径
+  倍增，Python 内存不随边数、最大组或路径长度增长。
+- Q 组来源：含两个及以上旧组 → `merge`；恰来自一个旧组 → `same`（`added_nodes`/
+  `added_edges` 说明是否有新增，新增节点或同组内新增边**不算**合并）；不含旧节点
+  → `new`。旧组 id 列表单独分页，不塞进摘要。
+
+### 首次连通与证据链
+
+- 按 rank 合并同时留有合并树，每条 `dst -> sys` 带当时 offset，且沿根方向严格
+  递增。两条请求首次连通的位置 = 二者 LCA 下两个子节点标签的较大者；更晚的边
+  根本不被查询。`connected_at_P` 直接比较 P 的两个组。
+- 连通后在该 offset 前缀内做逐层 BFS（距离层存 SQLite 临时表），按“步数最短，
+  再逐步取最小下一节点、再最小边 offset”给出规范链；链按需逐跳流出/分页，不与
+  更晚、更短的路径混用。
+- 未连通时区分：仍缺节点（`not_seen`，只有 lpad/late 或超出前缀）、已见但断开
+  （`disconnected`）、选了不同作业（`different_jobs`，边不跨作业）。
+
+### 命令行
+
+```bash
+python -m response_investigation.cli build --db inv.db --warehouse wh.db \
+    --jobs J1 J2 --P J1=4 J2=0 --Q J1=9 J2=40
+python -m response_investigation.cli status --db inv.db
+python -m response_investigation.cli node --db inv.db --step P \
+    --job J1 --partition lp --seq 3
+python -m response_investigation.cli groups --db inv.db --step Q --limit 50
+python -m response_investigation.cli members --db inv.db --step Q --group 7 --limit 100
+python -m response_investigation.cli edges --db inv.db --step Q --group 7 --limit 100
+python -m response_investigation.cli sources --db inv.db --group 7
+python -m response_investigation.cli resolve --db inv.db --step Q \
+    --a J1:lp:1 --b J1:lp:4
+python -m response_investigation.cli chain --db inv.db --step Q \
+    --a J1:lp:1 --b J1:lp:4 --limit 64
+```
+
+退出码：`0` 成功；`1` 拒绝（P/Q 非法、未知作业、缺口/超界、未知种类、缺失节点、
+错误 step）；`2` 用法错误；`3` 忙（另一个构建进程持有同一调查文件的锁）；`4`
+调查格式错误（缺失/空/未知版本/不完整/损坏）。
+
+### 性能与局部性
+
+- 节点定位、组成员、组边、旧组来源、链分页都是键集分页（`--after`/`limit`），
+  单页只读所求行；组、旧组、成员、边再多也不会塞进一条摘要。
+- 首通与证据链：并查集合并树给出 offset（O(log n) 祖先步），链用 SQLite 临时表
+  分层 BFS，每条边在有向索引上按 `(node, offset)` 查找；规范链按 `(a,b,k)` 只
+  计算一次并缓存进临时表，后续页只读自己那几跳。`ResponseInvestigation.stats()`
+  暴露节点定位、成员、边、来源、链跳数、BFS 访问节点数，供核验局部性。
+- 刻意不跑 `ANALYZE`（见上）：`sqlite_stat1` 会让这几条 BFS 查询明显变慢。BFS
+  有访问节点上限（超限明确失败），且每页只走自己的跳数；实测见
+  `drills/drill_response_scale.py` 的访问计数与 `EXPLAIN QUERY PLAN` 断言
+  （20 万+ match：组内 100 条边 0.06s / 101 行；5.2 万跳长链分 53 页共 0.8s；
+  峰值 RSS≈232MB，调查库≈110MB）。
+
+### 演练
+
+- `python -m drills.drill_response_reference`：小数据逐前缀与独立稠密参考实现
+  （逐条加边、显式可达性、显式最短链）逐项对照组、来源、成员、边与首通链。
+- `python -m drills.drill_response_snapshot`：构建期间真实追加投递、真实缺口、
+  超界、以及提交前后 `os._exit(117)` 的行为。
+- `python -m drills.drill_response_scale`：运行时生成高扇出组、带分叉与环的长链
+  和大量无关组（≥20 万 match），打印真实查询、分页、首通位置、源位置采样、峰值
+  RSS、磁盘占用，并用实际访问计数与 `EXPLAIN QUERY PLAN` 证明局部性。
+
 ## 事件文件演练
 
 JSON Lines，首条可为 `config`；`barrier` 记录触发演练检查点，不进入引擎。

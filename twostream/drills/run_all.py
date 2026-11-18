@@ -18,6 +18,9 @@ DRILLS = [
     "drills.drill_attribution_hand",
     "drills.drill_attribution_accept",
     "drills.drill_attribution_scale",
+    "drills.drill_response_reference",
+    "drills.drill_response_snapshot",
+    "drills.drill_response_scale",
 ]
 
 
